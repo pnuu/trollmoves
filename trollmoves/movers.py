@@ -691,7 +691,7 @@ class S3Mover(Mover):
         if S3FileSystem is None and boto3 is None:
             raise ImportError("S3Mover requires 's3fs' or 'boto3' to be installed.")
 
-        use_multipart = bool(self.attrs.get('s3_use_multipart', True))
+        use_multipart = bool(self.attrs.get('s3_use_multipart', False))
         use_copy = bool(self.attrs.get('s3_use_copy', False))
         tmp_prefix = self.attrs.get('tmp_prefix', '.')
 
@@ -791,7 +791,7 @@ class S3Mover(Mover):
         Default behavior: if multipart upload path was used, there's nothing to do.
         Otherwise, if configured, perform copy+delete (server-side copy) to move tmp key to final key.
         """
-        use_multipart = bool(self.attrs.get('s3_use_multipart', True))
+        use_multipart = bool(self.attrs.get('s3_use_multipart', False))
         use_copy = bool(self.attrs.get('s3_use_copy', False))
         tmp_prefix = self.attrs.get('tmp_prefix', '.')
 
