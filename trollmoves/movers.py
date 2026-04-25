@@ -51,7 +51,9 @@ S3_ALLOWED_SETTINGS = ["anon", "endpoint_url", "key", "secret",
                        "requester_pays", "default_block_size", "default_fill_cache",
                        "default_cache_type", "version_aware", "cache_regions",
                        "asynchronous", "config_kwargs", "kwargs", "session",
-                       "max_concurrency", "fixed_upload_size"]
+                       "max_concurrency", "fixed_upload_size",
+                       # allow our atomic-transfer and multipart options to pass through
+                       "s3_use_multipart", "s3_use_copy", "tmp_prefix", "s3_multipart_chunksize"]
 
 LOGGER = logging.getLogger(__name__)
 
@@ -783,20 +785,6 @@ class S3Mover(Mover):
         self.copy()
         os.remove(self.origin)
 
-
-def _create_s3_destination_path(s3, destination_file_path):
-    destination_path = os.path.dirname(destination_file_path)
-    if not s3.exists(destination_path):
-        s3.mkdirs(destination_path)
-
-
-MOVERS = {'ftp': FtpMover,
-          'file': FileMover,
-          '': FileMover,
-          'scp': ScpMover,
-          'sftp': SftpMover,
-          's3': S3Mover,
-          }
     def finalize_atomic_transfer(self, tmp_destination, final_destination):
         """Finalize atomic transfer for S3.
 
@@ -853,3 +841,16 @@ MOVERS = {'ftp': FtpMover,
         self.destination = urlparse('s3://' + bucket + '/' + final_key)
 
 
+def _create_s3_destination_path(s3, destination_file_path):
+    destination_path = os.path.dirname(destination_file_path)
+    if not s3.exists(destination_path):
+        s3.mkdirs(destination_path)
+
+
+MOVERS = {'ftp': FtpMover,
+          'file': FileMover,
+          '': FileMover,
+          'scp': ScpMover,
+          'sftp': SftpMover,
+          's3': S3Mover,
+          }
