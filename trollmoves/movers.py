@@ -39,6 +39,10 @@ try:
     from s3fs import S3FileSystem
 except ImportError:
     S3FileSystem = None
+try:
+    import boto3
+except ImportError:
+    boto3 = None
 
 from trollmoves.utils import clean_url
 
@@ -682,15 +686,80 @@ class S3Mover(Mover):
 
     def copy(self):
         """Copy the file to a bucket."""
-        if S3FileSystem is None:
-            raise ImportError("S3Mover requires 's3fs' to be installed.")
-        s3 = S3FileSystem(**self.attrs)
+        if S3FileSystem is None and boto3 is None:
+            raise ImportError("S3Mover requires 's3fs' or 'boto3' to be installed.")
+
+        use_multipart = bool(self.attrs.get('s3_use_multipart', True))
+        use_copy = bool(self.attrs.get('s3_use_copy', False))
+        tmp_prefix = self.attrs.get('tmp_prefix', '.')
+
+        # Destination path inside bucket (bucket/key or bucket/dir/file)
         destination_file_path = self._get_destination()
         LOGGER.debug('destination_file_path = %s', destination_file_path)
-        _create_s3_destination_path(s3, destination_file_path)
+
+        # Prefer multipart upload using boto3 when configured and available
+        if use_multipart and boto3 is not None:
+            # Derive final key: if basename starts with tmp_prefix, strip it
+            parts = destination_file_path.split('/')
+            if len(parts) == 1:
+                bucket = parts[0]
+                key = ''
+            else:
+                bucket = parts[0]
+                key = '/'.join(parts[1:])
+
+            basename = key.split('/')[-1] if key else ''
+            if basename.startswith(tmp_prefix):
+                final_basename = basename[len(tmp_prefix):]
+                final_key = key.rsplit('/', 1)[0] + '/' + final_basename if '/' in key else final_basename
+            else:
+                final_key = key
+
+            # Build boto3 client with optional client_kwargs or credentials
+            boto_kwargs = dict(self.attrs.get('client_kwargs', {})) if isinstance(self.attrs.get('client_kwargs', {}), dict) else {}
+            if self.attrs.get('key') and self.attrs.get('secret'):
+                # Use explicit credentials
+                client = boto3.client('s3', aws_access_key_id=self.attrs.get('key'), aws_secret_access_key=self.attrs.get('secret'), **boto_kwargs)
+            else:
+                client = boto3.client('s3', **boto_kwargs)
+
+            # multipart upload in chunks of 8MB
+            chunk_size = int(self.attrs.get('s3_multipart_chunksize', 8 * 1024 * 1024))
+            try:
+                mp = client.create_multipart_upload(Bucket=bucket, Key=final_key)
+                upload_id = mp['UploadId']
+                parts = []
+                part_number = 1
+                with open(self.origin, 'rb') as f:
+                    while True:
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        resp = client.upload_part(Bucket=bucket, Key=final_key, PartNumber=part_number, UploadId=upload_id, Body=data)
+                        parts.append({'ETag': resp['ETag'], 'PartNumber': part_number})
+                        part_number += 1
+                client.complete_multipart_upload(Bucket=bucket, Key=final_key, UploadId=upload_id, MultipartUpload={'Parts': parts})
+            except Exception as e:
+                LOGGER.exception('Multipart upload failed: %s', str(e))
+                try:
+                    client.abort_multipart_upload(Bucket=bucket, Key=final_key, UploadId=upload_id)
+                except Exception:
+                    pass
+                raise
+
+            # Update destination to final key
+            self.destination = urlparse('s3://' + bucket + '/' + final_key)
+            return
+
+        # Fallback: use s3fs put to destination_file_path (tmp or final)
+        if S3FileSystem is None:
+            raise ImportError("S3Mover requires 's3fs' to be installed for non-multipart operations.")
+        s3 = S3FileSystem(**self.attrs)
         LOGGER.debug('Before call to put: destination_file_path = %s', destination_file_path)
         LOGGER.debug('self.origin = %s', self.origin)
+        _create_s3_destination_path(s3, destination_file_path)
         s3.put(self.origin, destination_file_path)
+
 
     def _sanitize_attrs(self):
         keys = list(self.attrs.keys())
@@ -728,3 +797,59 @@ MOVERS = {'ftp': FtpMover,
           'sftp': SftpMover,
           's3': S3Mover,
           }
+    def finalize_atomic_transfer(self, tmp_destination, final_destination):
+        """Finalize atomic transfer for S3.
+
+        Default behavior: if multipart upload path was used, there's nothing to do.
+        Otherwise, if configured, perform copy+delete (server-side copy) to move tmp key to final key.
+        """
+        use_multipart = bool(self.attrs.get('s3_use_multipart', True))
+        use_copy = bool(self.attrs.get('s3_use_copy', False))
+        tmp_prefix = self.attrs.get('tmp_prefix', '.')
+
+        destination_file_path = tmp_destination and (tmp_destination.path.lstrip('/')) or self._get_destination()
+        # derive bucket and keys
+        parts = destination_file_path.split('/')
+        if len(parts) == 1:
+            bucket = parts[0]
+            tmp_key = ''
+        else:
+            bucket = parts[0]
+            tmp_key = '/'.join(parts[1:])
+
+        basename = tmp_key.split('/')[-1] if tmp_key else ''
+        if basename.startswith(tmp_prefix):
+            final_basename = basename[len(tmp_prefix):]
+            final_key = tmp_key.rsplit('/', 1)[0] + '/' + final_basename if '/' in tmp_key else final_basename
+        else:
+            final_key = tmp_key
+
+        # If multipart path was used and boto3 completed upload to final key, nothing to do
+        if use_multipart and boto3 is not None:
+            self.destination = urlparse('s3://' + bucket + '/' + final_key)
+            return
+
+        # Otherwise perform copy+delete if configured
+        if not use_copy:
+            # No server-side rename available and copy disabled: raise to indicate unsupported op
+            raise NotImplementedError('S3 atomic finalize requires either multipart uploads or copy+delete fallback')
+
+        # use s3fs or boto3 to copy and delete tmp key
+        if S3FileSystem is not None:
+            s3 = S3FileSystem(**self.attrs)
+            s3.copy(destination_file_path, bucket + '/' + final_key)
+            s3.rm(destination_file_path)
+            self.destination = urlparse('s3://' + bucket + '/' + final_key)
+            return
+
+        if boto3 is None:
+            raise ImportError('No S3 backend available for copy+delete finalize')
+        # boto3 copy_object and delete_object
+        boto_kwargs = dict(self.attrs.get('client_kwargs', {})) if isinstance(self.attrs.get('client_kwargs', {}), dict) else {}
+        client = boto3.client('s3', **boto_kwargs)
+        copy_source = {'Bucket': bucket, 'Key': tmp_key}
+        client.copy_object(CopySource=copy_source, Bucket=bucket, Key=final_key)
+        client.delete_object(Bucket=bucket, Key=tmp_key)
+        self.destination = urlparse('s3://' + bucket + '/' + final_key)
+
+
