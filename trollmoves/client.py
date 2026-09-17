@@ -4,13 +4,15 @@ import bz2
 import hashlib
 import logging
 import os
+import shutil
 import socket
 import subprocess
 import tarfile
+import tempfile
 import time
 from collections import deque
 from configparser import ConfigParser
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from threading import Event, Lock, Thread
 from urllib.parse import urlparse, urlunparse
 
@@ -312,19 +314,56 @@ def clean_ongoing_transfer(uid):
     return msgs
 
 
+@contextmanager
+def decompression_directory(destination_directory):
+    """Provide a temporary directory to decompress into, inside *destination_directory*.
+
+    Decompressing straight to the final filename lets Posttroll-agnostic consumers that
+    watch the destination directory pick up a file that is not written yet. Doing the
+    work out of sight and moving the results in afterwards makes every file appear
+    complete at once. The directory is created inside the destination so that the move
+    stays on the same filesystem and is therefore a rename.
+    """
+    tmp_directory = tempfile.mkdtemp(prefix=".trollmoves_", dir=destination_directory or ".")
+    try:
+        yield tmp_directory
+    finally:
+        shutil.rmtree(tmp_directory, ignore_errors=True)
+
+
+def move_into_place(source, destination):
+    """Move a decompressed file from *source* to its final name *destination*."""
+    destination_directory = os.path.dirname(destination)
+    if destination_directory:
+        os.makedirs(destination_directory, exist_ok=True)
+    os.replace(source, destination)
+
+
 def unpack_tar(filename, **kwargs):
     """Unpack tar files."""
     destdir = os.path.dirname(filename)
-    try:
-        with tarfile.open(filename) as tar:
-            tar.extractall(destdir)
-            members = tar.getmembers()
-    except tarfile.ReadError as err:
-        raise IOError(str(err))
+    with decompression_directory(destdir) as tmp_directory:
+        try:
+            with tarfile.open(filename) as tar:
+                tar.extractall(tmp_directory)
+                members = tar.getmembers()
+        except tarfile.ReadError as err:
+            raise IOError(str(err))
+        for member in members:
+            _move_member_into_place(member, tmp_directory, destdir)
     fnames = tuple(os.path.join(destdir, member.name) for member in members)
     if len(fnames) == 1:
         return fnames[0]
     return fnames
+
+
+def _move_member_into_place(member, tmp_directory, destdir):
+    """Move an extracted tar *member* to its final place under *destdir*."""
+    destination = os.path.join(destdir, member.name)
+    if member.isdir():
+        os.makedirs(destination, exist_ok=True)
+    elif member.isfile():
+        move_into_place(os.path.join(tmp_directory, member.name), destination)
 
 
 def unpack_xrit(filename, **kwargs):
@@ -337,7 +376,9 @@ def unpack_xrit(filename, **kwargs):
                       "Set it with 'xritdecompressor' config option.")
     destdir = os.path.dirname(filename)
     out_fname = os.path.join(destdir, os.path.basename(filename)[:-2] + "__")
-    check_output([cmd, filename], cwd=(destdir))
+    with decompression_directory(destdir) as tmp_directory:
+        check_output([cmd, filename], cwd=tmp_directory)
+        move_into_place(os.path.join(tmp_directory, os.path.basename(out_fname)), out_fname)
     return out_fname
 
 
@@ -347,18 +388,21 @@ def unpack_bzip(filename, **kwargs):
     out_fname = filename[:-4]
     if os.path.exists(out_fname):
         return out_fname
-    with open(out_fname, "wb") as dest:
-        try:
-            orig = bz2.BZ2File(filename, "r")
-            while True:
-                block = orig.read(block_size)
+    with decompression_directory(os.path.dirname(out_fname)) as tmp_directory:
+        tmp_fname = os.path.join(tmp_directory, os.path.basename(out_fname))
+        with open(tmp_fname, "wb") as dest:
+            try:
+                orig = bz2.BZ2File(filename, "r")
+                while True:
+                    block = orig.read(block_size)
 
-                if not block:
-                    break
-                dest.write(block)
-            LOGGER.debug("Bunzipped %s to %s", filename, out_fname)
-        finally:
-            orig.close()
+                    if not block:
+                        break
+                    dest.write(block)
+                LOGGER.debug("Bunzipped %s to %s", filename, out_fname)
+            finally:
+                orig.close()
+        move_into_place(tmp_fname, out_fname)
     return out_fname
 
 
